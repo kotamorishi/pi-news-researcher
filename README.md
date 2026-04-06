@@ -1,7 +1,7 @@
 # Pi News Researcher
 
 Raspberry Pi 5 + Hailo-10H AI accelerator を使った常時音声認識システム。
-認識結果をSQLiteに保存し、電光掲示板（Galactic Unicorn）にリアルタイム表示。
+認識結果をLLMでフィルタリングしてSQLiteに保存し、電光掲示板（Galactic Unicorn）にリアルタイム表示。
 
 ## System Architecture
 
@@ -11,8 +11,12 @@ graph TB
         MIC[USB Audio HAT<br/>SSS1629A5] -->|48kHz PCM| AD[Audio Downsampler<br/>48kHz → 16kHz]
         AD -->|16kHz PCM| VAD[Voice Activity Detector<br/>WebRTC VAD]
         VAD -->|Speech chunks| Q[Utterance Queue]
-        Q --> WHISPER[Hailo-10H<br/>Whisper-Small]
-        WHISPER --> SPEAKER[Speaker ID<br/>Resemblyzer]
+        Q --> WHISPER[Whisper-Small<br/>Hailo-10H]
+        WHISPER --> RULE[Rule Filter<br/>short/filler removal]
+        RULE -->|pass| LLM[Qwen3-1.7B<br/>Hailo-10H]
+        RULE -->|reject| DROP1[Drop]
+        LLM -->|meaningful| SPEAKER[Speaker ID<br/>Resemblyzer]
+        LLM -->|not meaningful| DROP2[Drop]
         SPEAKER --> DB[(SQLite DB)]
         SPEAKER -->|if enabled| LED
         WEB[Web UI<br/>:8080] --> DB
@@ -25,9 +29,17 @@ graph TB
         BROWSER[Browser] --> WEB
     end
 
+    subgraph "Hailo-10H (Shared VDevice)"
+        WHISPER
+        LLM
+    end
+
     style WHISPER fill:#0ff,color:#000
+    style LLM fill:#0ff,color:#000
     style DB fill:#f90,color:#000
     style LED fill:#0f0,color:#000
+    style DROP1 fill:#555,color:#999
+    style DROP2 fill:#555,color:#999
 ```
 
 ## Processing Pipeline
@@ -38,6 +50,7 @@ sequenceDiagram
     participant VAD
     participant Queue
     participant Whisper
+    participant LLM as Qwen3-1.7B
     participant DB
     participant LED
 
@@ -62,10 +75,22 @@ sequenceDiagram
         Whisper->>Whisper: Retry as English
     end
 
-    Whisper->>DB: Save (timestamp, text, duration, speaker)
+    Note over Whisper: Rule-based pre-filter
+    alt Short text / filler words
+        Whisper-->>Whisper: Drop
+    end
 
-    opt Display enabled
-        Whisper->>LED: Word-by-word display (0.3s interval)
+    Whisper->>LLM: "Is this meaningful?"
+    LLM->>LLM: YES / NO judgment
+
+    alt NO
+        LLM-->>LLM: Drop
+    end
+
+    LLM->>DB: Save (timestamp, text, duration, speaker)
+
+    opt Display enabled (toggle via Web UI)
+        LLM->>LED: Word-by-word display (0.3s interval)
     end
 ```
 
@@ -74,21 +99,23 @@ sequenceDiagram
 | Component | Model | Role |
 |-----------|-------|------|
 | SBC | Raspberry Pi 5 (16GB) | Host |
-| AI Accelerator | Hailo-10H (AI HAT+) | Whisper inference |
+| AI Accelerator | Hailo-10H (AI HAT+, 8GB) | Whisper + LLM inference |
 | Audio | USB Audio HAT (SSS1629A5) | Microphone input |
 | Display | Galactic Unicorn (RPi Pico) | LED text display |
 | Remote Mic (optional) | ESP32 + I2S mic | Remote audio input |
 
 ## Software Stack
 
-| Component | Version |
-|-----------|---------|
-| HailoRT | 5.3.0 |
-| Whisper Model | Whisper-Small (386MB HEF) |
-| Speaker ID | Resemblyzer |
-| VAD | WebRTC VAD |
-| Web Server | Python http.server |
-| Database | SQLite |
+| Component | Version | Role |
+|-----------|---------|------|
+| HailoRT | 5.3.0 | AI runtime |
+| Whisper-Small | 386MB HEF | Speech-to-text |
+| Qwen3-1.7B-Instruct | 2.7GB HEF | Content filter (meaningful speech detection) |
+| Resemblyzer | 0.1.4 | Speaker identification |
+| WebRTC VAD | 2.0.10 | Voice activity detection |
+| SQLite | built-in | Transcription database |
+
+Both Whisper-Small and Qwen3-1.7B run on the same Hailo-10H using shared VDevice.
 
 ## Setup
 
@@ -99,8 +126,9 @@ sequenceDiagram
 hailortcli fw-control identify
 # Should show: Firmware Version: 5.3.0
 
-# Whisper-Small model
+# Models
 ls /usr/local/hailo/resources/models/hailo10h/Whisper-Small.hef
+ls /usr/local/hailo/resources/models/hailo10h/Qwen3-1.7B-Instruct.hef
 ```
 
 ### 2. Install Dependencies
@@ -212,6 +240,19 @@ journalctl -u hailo-whisper-display -f
 journalctl -u hailo-whisper-display --since today
 ```
 
+## Content Filtering
+
+Transcriptions pass through two filter stages before being saved:
+
+### 1. Rule-based filter (instant)
+- Text 3 characters or shorter
+- Known filler patterns: `...`, `So,`, `Yeah.`, `OK.`, `Uh,`, `Um,`
+
+### 2. LLM filter (Qwen3-1.7B on Hailo-10H)
+- Asks the model: "Is this a meaningful sentence worth logging?"
+- Drops fragments, noise artifacts, and incomplete phrases
+- Runs on the same Hailo-10H as Whisper via shared VDevice
+
 ## Database Schema
 
 ```sql
@@ -237,7 +278,8 @@ CREATE TABLE daily_summaries (
 A separate server (`openai_server.py`) provides OpenAI-compatible `/v1/chat/completions` endpoint using Hailo VLM (Qwen3-VL-2B-Instruct). Supports both text and image inputs.
 
 ```bash
-# Start (separate from whisper service, cannot run simultaneously)
+# Stop whisper service first, then start VLM server
+sudo systemctl stop hailo-whisper-display
 sudo systemctl start hailo-openai
 
 # Text request
@@ -246,4 +288,4 @@ curl http://192.168.2.55:8000/v1/chat/completions \
   -d '{"model":"qwen3-vl-2b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-> Note: VLM server and Whisper service share the Hailo-10H device and cannot run simultaneously.
+> Note: VLM server uses a different model (Qwen3-VL-2B) that requires exclusive VDevice access. Stop the whisper service before starting the VLM server.
