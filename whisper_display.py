@@ -25,12 +25,13 @@ sys.path.insert(0, "/home/kota/galactic-unicorn-horn")
 from renderer import render_text_to_bitmap_payload
 
 from hailo_platform import VDevice
-from hailo_platform.genai import Speech2Text, Speech2TextTask
+from hailo_platform.genai import Speech2Text, Speech2TextTask, LLM
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 WHISPER_HEF = "/usr/local/hailo/resources/models/hailo10h/Whisper-Small.hef"
+LLM_HEF = "/usr/local/hailo/resources/models/hailo10h/Qwen3-1.7B-Instruct.hef"
 LED_DEVICE_IP = "192.168.2.61"
 DISPLAY_CLEAR_DELAY = 10
 _display_enabled = False  # Default: do not send to LED display
@@ -374,6 +375,35 @@ DISPLAY_WIDTH_CHARS = 10  # Approximate characters that fit on display at once
 WORD_DISPLAY_INTERVAL = 0.3  # seconds between each word group
 
 
+def is_meaningful(llm, text):
+    """Use LLM to judge if transcribed text is meaningful speech."""
+    # Quick rule-based filter first
+    stripped = text.strip().rstrip('.!?,')
+    if len(stripped) <= 3:
+        return False
+    if text.strip() in ('...', '--', 'So,', 'Yeah.', 'OK.', 'Uh,', 'Um,'):
+        return False
+
+    prompt = [{
+        "role": "user",
+        "content": [{"type": "text", "text": f"""Judge if this transcribed speech is a meaningful sentence worth logging.
+Reply ONLY "YES" or "NO".
+
+- YES: complete thought, question, statement, or instruction
+- NO: filler words, fragments, noise artifacts, meaningless sounds
+
+Text: "{text}" """}]
+    }]
+    try:
+        llm.clear_context()
+        response = llm.generate_all(prompt=prompt, max_generated_tokens=5, temperature=0.1)
+        answer = response.strip().upper().replace("<|IM_END|>", "").replace("<|im_end|>", "").strip()
+        return answer.startswith("YES")
+    except Exception:
+        logger.exception("LLM filter failed")
+        return True  # On error, keep the text
+
+
 def send_to_display(text, color=None):
     """Display text word-by-word in quick succession, then show full text scrolling."""
     if color is None:
@@ -441,11 +471,16 @@ def main():
 
     logger.info("Initializing Hailo device...")
     params = VDevice.create_params()
+    params.group_id = "SHARED"
     vdevice = VDevice(params)
 
     logger.info("Loading Whisper-Small...")
     speech2text = Speech2Text(vdevice, WHISPER_HEF)
     logger.info("Whisper-Small loaded")
+
+    logger.info("Loading Qwen3-1.7B for filtering...")
+    llm = LLM(vdevice, LLM_HEF)
+    logger.info("Qwen3-1.7B loaded")
 
     vad = webrtcvad.Vad(2)
 
@@ -530,6 +565,11 @@ def main():
                             text = text2
 
                 logger.info("Recognized: %s", text)
+
+                if not is_meaningful(llm, text):
+                    logger.info("Filtered (not meaningful): %s", text)
+                    continue
+
                 speaker = identify_speaker(audio_i16)
                 insert_transcription(text, duration_sec=duration, speaker=speaker)
                 if _display_enabled:
@@ -633,6 +673,7 @@ def main():
     finally:
         utterance_queue.put(None)  # Signal worker to stop
         worker.join(timeout=5)
+        llm.release()
         speech2text.release()
         vdevice.release()
         if clear_timer:
