@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.db
+*.wav
+venv/
+.env
+speaker_profiles/*.npy
